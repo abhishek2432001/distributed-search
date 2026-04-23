@@ -1,0 +1,235 @@
+version: "3.9"
+
+x-django-env: &django-env
+  SECRET_KEY: ${SECRET_KEY:-insecure-dev-secret-change-in-prod}
+  DEBUG: ${DEBUG:-True}
+  ALLOWED_HOSTS: ${ALLOWED_HOSTS:-*}
+  # PostgreSQL
+  DATABASE_URL: postgres://${POSTGRES_USER:-search}:${POSTGRES_PASSWORD:-search}@postgres:5432/${POSTGRES_DB:-searchdb}
+  # Elasticsearch
+  ELASTICSEARCH_URL: http://elasticsearch:9200
+  # Redis
+  REDIS_URL: redis://redis:6379/0
+  # Celery / RabbitMQ
+  CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASS:-guest}@rabbitmq:5672//
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  # Rate limiting defaults (per minute per tenant)
+  DEFAULT_RATE_LIMIT: ${DEFAULT_RATE_LIMIT:-100}
+
+services:
+  # PostgreSQL — Source of Truth
+  postgres:
+    image: postgres:16-alpine
+    container_name: search_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-searchdb}
+      POSTGRES_USER: ${POSTGRES_USER:-search}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-search}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-search} -d ${POSTGRES_DB:-searchdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - search_network
+
+  # ─────────────────────────────────────────────
+  # Elasticsearch — Search Engine
+  # ─────────────────────────────────────────────
+  elasticsearch:
+    image: elasticsearch:8.13.4
+    container_name: search_elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - cluster.name=search-cluster
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSL http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - search_network
+
+  # ─────────────────────────────────────────────
+  # Redis — Cache & Rate Limiting
+  # ─────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: search_redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - search_network
+
+  # ─────────────────────────────────────────────
+  # RabbitMQ — Message Broker
+  # ─────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: search_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - search_network
+
+  # ─────────────────────────────────────────────
+  # Django Web API
+  # ─────────────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: search_web
+    restart: unless-stopped
+    command: >
+      sh -c "python manage.py wait_for_db &&
+             python manage.py migrate --noinput &&
+             python manage.py create_es_indices &&
+             python manage.py runserver 0.0.0.0:8000"
+    environment:
+      <<: *django-env
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - search_network
+
+  # ─────────────────────────────────────────────
+  # Celery Worker — Async Document Indexing
+  # ─────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: search_celery_worker
+    restart: unless-stopped
+    command: >
+      celery -A search_service worker
+             --loglevel=info
+             --concurrency=4
+             --queues=document_index,document_delete,default
+             --hostname=worker@%h
+    environment:
+      <<: *django-env
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - search_network
+
+  # ─────────────────────────────────────────────
+  # Celery Beat — Scheduled Tasks (e.g., cleanup)
+  # ─────────────────────────────────────────────
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: search_celery_beat
+    restart: unless-stopped
+    command: >
+      celery -A search_service beat
+             --loglevel=info
+             --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment:
+      <<: *django-env
+    volumes:
+      - .:/app
+    depends_on:
+      - celery_worker
+    networks:
+      - search_network
+
+  # ─────────────────────────────────────────────
+  # Flower — Celery Monitoring UI (dev only)
+  # ─────────────────────────────────────────────
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: search_flower
+    restart: unless-stopped
+    command: >
+      celery -A search_service flower
+             --port=5555
+             --broker=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASS:-guest}@rabbitmq:5672//
+    environment:
+      <<: *django-env
+    ports:
+      - "5555:5555"
+    depends_on:
+      - celery_worker
+      - rabbitmq
+    networks:
+      - search_network
+
+volumes:
+  postgres_data:
+  elasticsearch_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  search_network:
+    driver: bridge

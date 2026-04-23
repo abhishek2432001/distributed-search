@@ -1,0 +1,36 @@
+# Core Django
+Django==5.0.6
+djangorestframework==3.15.2
+django-environ==0.11.2
+django-cors-headers==4.4.0
+
+# PostgreSQL
+psycopg2-binary==2.9.9
+dj-database-url==2.2.0
+
+# Elasticsearch
+elasticsearch==8.13.2
+elasticsearch-dsl==8.13.1
+
+# Redis & Caching
+redis==5.0.7
+django-redis==5.4.0
+
+# Celery & Task Queue
+celery==5.4.0
+django-celery-beat==2.6.0
+django-celery-results==2.5.1
+kombu==5.3.7
+
+# RabbitMQ / AMQP
+amqp==5.2.0
+flower==2.0.1
+
+# API & Serialization
+djangorestframework==3.15.2
+drf-spectacular==0.27.2
+
+# Utilities
+python-decouple==3.8
+gunicorn==22.0.0
+whitenoise==6.7.0
