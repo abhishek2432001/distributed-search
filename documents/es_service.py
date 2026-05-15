@@ -183,7 +183,6 @@ def search_documents(
             "bool": {
                 "must": [text_query],
                 "filter": [
-                    {"term": {"tenant_id": tenant_slug}},  # mandatory isolation
                     {"term": {"is_deleted": False}},
                 ],
             }

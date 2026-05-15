@@ -22,7 +22,7 @@ class DocumentCreateSerializer(serializers.Serializer):
 
 
 class DocumentDetailSerializer(serializers.ModelSerializer):
-    tenant_id = serializers.UUIDField(source="tenant_id", read_only=True)
+    tenant_id = serializers.UUIDField(read_only=True)
 
     class Meta:
         model = Document
